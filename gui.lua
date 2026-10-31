@@ -1976,6 +1976,14 @@ do
             Parent = ToggleLabel;
         });
 
+        -- the label spans the whole row so color swatches / keys sit on the right edge of the group
+        local function ResizeToggleLabel()
+            ToggleLabel.Size = UDim2.new(0, math.max(Container.AbsoluteSize.X - 19 - 4, 60), 1, 0);
+        end;
+
+        Container:GetPropertyChangedSignal('AbsoluteSize'):Connect(ResizeToggleLabel);
+        ResizeToggleLabel();
+
         local ToggleRegion = Library:Create('Frame', {
             BackgroundTransparency = 1;
             Size = UDim2.new(0, 170, 1, 0);
@@ -2793,6 +2801,16 @@ do
         table.insert(Library.DependencyBoxes, Depbox);
 
         return Depbox;
+    end;
+
+    -- Group:AddColorPicker('Idx', { Text = 'color', Default = Color3... })
+    -- A label with the color swatch on its right side; works in groupboxes and in toggle settings windows.
+    -- Returns the color picker.
+    function Funcs:AddColorPicker(Idx, Info)
+        local Label = self:AddLabel(Info.Text or Idx);
+        Label:AddColorPicker(Idx, Info);
+
+        return Options[Idx];
     end;
 
     BaseGroupbox.__index = Funcs;

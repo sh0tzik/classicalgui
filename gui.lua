@@ -2381,6 +2381,8 @@ do
         });
         Library:Round(ListOuter, 4);
 
+        Dropdown.ListOuter = ListOuter;
+
         Library:AddToRegistry(ListOuter, {
             BackgroundColor3 = 'MainColor';
             BorderColor3 = 'OutlineColor';
@@ -3082,10 +3084,10 @@ local function CopyValue(Value)
     return Value;
 end;
 
--- value that should be saved: the normal one, even while a bind is overriding it
+-- value that should be saved: the normal one, even while binds are overriding it
 function Library:GetBaseValue(Element)
-    if Element.Bind and Element.Bind.Active then
-        return Element.Bind.Stash;
+    if Element.BindStash then
+        return Element.BindStash.Value;
     end;
 
     return Element.Value;
@@ -3103,197 +3105,343 @@ local function BindKeyName(Input)
     end;
 end;
 
+-- An element can have several binds ("slots"): each one has its own key, mode and value.
+-- When several are active at once the one that was pressed last wins; when it is released the
+-- element falls back to the previous active bind, and then to its normal value.
 function Library:AttachBind(Element, Region, Info, Idx, Groupbox)
-    if Info.NoBind or Info.SpecialType or Element.Bind then
+    if Info.NoBind or Info.SpecialType or Element.Binds then
         return;
     end;
 
     local Kind = Element.Type;
 
-    local Bind = {
-        Type = 'KeyPicker'; -- same shape as a keypicker so the SaveManager stores it
-        Value = 'None';
-        Mode = 'Hold';
-        Active = false;
-        Listening = false;
-    };
+    Element.Binds = {}; -- slot number -> bind
+    Element.BindStack = {}; -- active binds in the order they were pressed
+    Element.BindStash = nil; -- the normal value, kept while a bind overrides it
 
     local Popup = MakePopup(200, function()
         return UDim2.fromOffset(Mouse.X + 4, Mouse.Y + 4);
     end, Groupbox.IsPopup and Groupbox or nil, { Region }, Enum.UserInputType.MouseButton2);
 
-    local KeyButton = Popup:AddButton({ Text = 'bind: none', Func = function() end });
-    Popup:AddBlank(2);
+    local Slots = {};
+    Element.BindSlots = Slots;
 
-    local ModeIdx = Idx .. '_bindmode';
-    local ValueIdx = Idx .. '_bindvalue';
+    local function Recompute()
+        local Stack = Element.BindStack;
+        local Top = Stack[#Stack];
 
-    Popup:AddDropdown(ModeIdx, { Text = 'mode', Values = { 'Hold', 'Toggle' }, Default = 1, NoBind = true });
-
-    Popup:AddDivider();
-
-    if Kind == 'Toggle' then
-        Popup:AddToggle(ValueIdx, { Text = 'value while bound', Default = true, NoBind = true });
-    elseif Kind == 'Slider' then
-        Popup:AddSlider(ValueIdx, {
-            Text = Info.Text or 'value';
-            Default = Info.Default;
-            Min = Info.Min;
-            Max = Info.Max;
-            Rounding = Info.Rounding;
-            Suffix = Info.Suffix;
-            NoBind = true;
-        });
-    elseif Kind == 'Dropdown' then
-        Popup:AddDropdown(ValueIdx, {
-            Text = Info.Text or 'value';
-            Values = Info.Values;
-            Multi = Info.Multi;
-            Default = Info.Default;
-            AllowNull = true;
-            NoBind = true;
-        });
-    end;
-
-    -- the mode is stored inside the bind itself, not as a separate saved option
-    if Library.SaveManager then
-        Library.SaveManager.Ignore[ModeIdx] = true;
-    end;
-
-    local ModeDropdown = Options[ModeIdx];
-    local BoundValue = Options[ValueIdx] or Toggles[ValueIdx];
-
-    function Bind:Update()
-        local Text = Bind.Listening and '...' or Bind.Value;
-        KeyButton.Label.Text = 'bind: ' .. string.lower(Text);
-    end;
-
-    function Bind:SetActive(Bool)
-        Bool = not not Bool;
-
-        if Bool == Bind.Active then
-            return;
+        for _, Bind in next, Element.Binds do
+            Bind.Top = (Bind == Top);
         end;
 
-        Bind.Active = Bool;
+        if Top then
+            if not Element.BindStash then
+                Element.BindStash = { Value = CopyValue(Element.Value) };
+            end;
 
-        if Bool then
-            Bind.Stash = CopyValue(Element.Value);
-            Element:SetValue(CopyValue(BoundValue.Value));
-        else
-            local Stash = Bind.Stash;
-            Bind.Stash = nil;
-            Element:SetValue(Stash);
+            Element:SetValue(CopyValue(Top.BoundValue.Value));
+        elseif Element.BindStash then
+            local Stash = Element.BindStash;
+            Element.BindStash = nil;
+
+            Element:SetValue(Stash.Value);
         end;
     end;
 
-    function Bind:SetValue(Data)
-        Bind:SetActive(false);
+    local function CreateSlot(Number)
+        local Suffix = Number == 1 and '' or tostring(Number);
+        local BindIdx = Idx .. '_bind' .. Suffix;
+        local ModeIdx = Idx .. '_bindmode' .. Suffix;
+        local ValueIdx = Idx .. '_bindvalue' .. Suffix;
 
-        Bind.Value = Data[1] or 'None';
-        Bind.Mode = Data[2] or 'Hold';
+        local Bind = {
+            Type = 'KeyPicker'; -- same shape as a keypicker so the SaveManager stores it
+            Value = 'None';
+            Mode = 'Hold';
+            Active = false;
+            Listening = false;
+            Number = Number;
+            Top = false;
+        };
 
-        ModeDropdown:SetValue(Bind.Mode);
-        Bind:Update();
-    end;
+        local Slot = { Bind = Bind, Frames = {}, Connections = {} };
 
-    ModeDropdown:OnChanged(function(Value)
-        Bind.Mode = Value or 'Hold';
+        -- everything this slot adds to the window, so it can be removed again
+        local Before = {};
 
-        if Bind.Mode == 'Toggle' then
+        for _, Child in next, Popup.Container:GetChildren() do
+            Before[Child] = true;
+        end;
+
+        if Number > 1 then
+            Popup:AddDivider();
+        end;
+
+        local KeyButton = Popup:AddButton({ Text = 'bind: none', Func = function() end });
+
+        KeyButton:AddButton({ Text = Number == 1 and 'clear' or 'remove', Func = function()
+            if Number == 1 then
+                Bind:SetValue({ 'None', Bind.Mode });
+            else
+                Slot:Remove();
+            end;
+        end });
+
+        Popup:AddBlank(2);
+
+        Popup:AddDropdown(ModeIdx, { Text = 'mode', Values = { 'Hold', 'Toggle' }, Default = 1, NoBind = true });
+
+        if Kind == 'Toggle' then
+            Popup:AddToggle(ValueIdx, { Text = 'value while bound', Default = true, NoBind = true });
+        elseif Kind == 'Slider' then
+            Popup:AddSlider(ValueIdx, {
+                Text = Info.Text or 'value';
+                Default = Info.Default;
+                Min = Info.Min;
+                Max = Info.Max;
+                Rounding = Info.Rounding;
+                Suffix = Info.Suffix;
+                NoBind = true;
+            });
+        elseif Kind == 'Dropdown' then
+            Popup:AddDropdown(ValueIdx, {
+                Text = Info.Text or 'value';
+                Values = Info.Values;
+                Multi = Info.Multi;
+                Default = Info.Default;
+                AllowNull = true;
+                NoBind = true;
+            });
+        end;
+
+        for _, Child in next, Popup.Container:GetChildren() do
+            if not Before[Child] and not Child:IsA('UIListLayout') then
+                table.insert(Slot.Frames, Child);
+            end;
+        end;
+
+        -- the mode is stored inside the bind itself, not as a separate saved option
+        if Library.SaveManager then
+            Library.SaveManager.Ignore[ModeIdx] = true;
+        end;
+
+        local ModeDropdown = Options[ModeIdx];
+        local BoundValue = Options[ValueIdx] or Toggles[ValueIdx];
+
+        Bind.BoundValue = BoundValue;
+
+        function Bind:Update()
+            local Text = Bind.Listening and '...' or Bind.Value;
+            local Prefix = Number == 1 and 'bind: ' or ('bind ' .. Number .. ': ');
+
+            KeyButton.Label.Text = Prefix .. string.lower(Text);
+        end;
+
+        function Bind:SetActive(Bool)
+            Bool = not not Bool;
+
+            if Bool == Bind.Active then
+                return;
+            end;
+
+            Bind.Active = Bool;
+
+            local Stack = Element.BindStack;
+
+            if Bool then
+                table.insert(Stack, Bind);
+            else
+                local Position = table.find(Stack, Bind);
+
+                if Position then
+                    table.remove(Stack, Position);
+                end;
+            end;
+
+            Recompute();
+        end;
+
+        function Bind:SetValue(Data)
             Bind:SetActive(false);
-        end;
-    end);
 
-    -- editing the bound value while the bind is active applies it straight away
-    BoundValue:OnChanged(function(Value)
-        if Bind.Active then
-            Element:SetValue(CopyValue(Value));
-        end;
-    end);
+            Bind.Value = Data[1] or 'None';
+            Bind.Mode = Data[2] or 'Hold';
 
-    KeyButton.Func = function()
-        if Bind.Listening then
-            return;
+            ModeDropdown:SetValue(Bind.Mode);
+            Bind:Update();
         end;
 
-        Bind.Listening = true;
-        Bind:Update();
+        ModeDropdown:OnChanged(function(Value)
+            Bind.Mode = Value or 'Hold';
 
-        task.delay(0.1, function()
-            local Connection;
+            if Bind.Mode == 'Toggle' then
+                Bind:SetActive(false);
+            end;
+        end);
 
-            Connection = InputService.InputBegan:Connect(function(Input)
-                local Key = BindKeyName(Input);
+        -- editing the bound value while this bind is the active one applies it straight away
+        BoundValue:OnChanged(function(Value)
+            if Bind.Top then
+                Element:SetValue(CopyValue(Value));
+            end;
+        end);
 
-                if not Key then
-                    return;
-                end;
+        KeyButton.Func = function()
+            if Bind.Listening then
+                return;
+            end;
 
-                if Key == 'Escape' or Key == 'Backspace' then
-                    Key = 'None';
-                end;
+            Bind.Listening = true;
+            Bind:Update();
 
-                Connection:Disconnect();
+            task.delay(0.1, function()
+                local Connection;
 
-                Bind:SetValue({ Key, Bind.Mode });
+                Connection = InputService.InputBegan:Connect(function(Input)
+                    local Key = BindKeyName(Input);
 
-                -- keep ignoring input for a moment so the key just bound doesn't trigger it
-                task.delay(0.15, function()
-                    Bind.Listening = false;
-                    Bind:Update();
+                    if not Key then
+                        return;
+                    end;
+
+                    if Key == 'Escape' or Key == 'Backspace' then
+                        Key = 'None';
+                    end;
+
+                    Connection:Disconnect();
+
+                    Bind:SetValue({ Key, Bind.Mode });
+
+                    -- keep ignoring input for a moment so the key just bound doesn't trigger it
+                    task.delay(0.15, function()
+                        Bind.Listening = false;
+                        Bind:Update();
+                    end);
                 end);
             end);
+        end;
+
+        -- activation: never while typing (chat, text boxes) or while picking the key
+        local Began = InputService.InputBegan:Connect(function(Input, Processed)
+            if Bind.Listening or Bind.Value == 'None' then
+                return;
+            end;
+
+            if InputService:GetFocusedTextBox() then
+                return;
+            end;
+
+            if BindKeyName(Input) ~= Bind.Value then
+                return;
+            end;
+
+            -- clicks on gui (including this menu) don't count for mouse binds
+            if Processed and Input.UserInputType ~= Enum.UserInputType.Keyboard then
+                return;
+            end;
+
+            if Bind.Mode == 'Toggle' then
+                Bind:SetActive(not Bind.Active);
+            else
+                Bind:SetActive(true);
+            end;
         end);
+
+        local Ended = InputService.InputEnded:Connect(function(Input)
+            if Bind.Mode == 'Hold' and Bind.Active and BindKeyName(Input) == Bind.Value then
+                Bind:SetActive(false);
+            end;
+        end);
+
+        Library:GiveSignal(Began);
+        Library:GiveSignal(Ended);
+        table.insert(Slot.Connections, Began);
+        table.insert(Slot.Connections, Ended);
+
+        function Slot:Remove()
+            Bind:SetActive(false);
+
+            for _, Connection in next, Slot.Connections do
+                Connection:Disconnect();
+            end;
+
+            -- dropdown lists live outside the window, so they have to go too
+            for _, Option in next, { Options[ModeIdx], Options[ValueIdx] } do
+                if Option.ListOuter then
+                    Library:RemoveFromRegistry(Option.ListOuter);
+                    Option.ListOuter:Destroy();
+                    Library.OpenedFrames[Option.ListOuter] = nil;
+                end;
+            end;
+
+            for _, Frame in next, Slot.Frames do
+                for _, Descendant in next, Frame:GetDescendants() do
+                    Library:RemoveFromRegistry(Descendant);
+                end;
+
+                Library:RemoveFromRegistry(Frame);
+                Frame:Destroy();
+            end;
+
+            Options[BindIdx] = nil;
+            Options[ModeIdx] = nil;
+            Options[ValueIdx] = nil;
+            Toggles[ValueIdx] = nil;
+
+            Library:RemoveBindListEntry(Bind);
+
+            Slots[Number] = nil;
+            Element.Binds[Number] = nil;
+
+            if Number == 1 then
+                Element.Bind = nil;
+            end;
+        end;
+
+        Slots[Number] = Slot;
+        Element.Binds[Number] = Bind;
+        Options[BindIdx] = Bind;
+
+        Library:AddBindListEntry(Bind, Info.Text or Idx, Element, Info);
+
+        Bind:Update();
+
+        return Slot;
     end;
 
-    -- activation: never while typing (chat, text boxes) or while picking the key
-    Library:GiveSignal(InputService.InputBegan:Connect(function(Input, Processed)
-        if Bind.Listening or Bind.Value == 'None' then
-            return;
+    -- the SaveManager calls this before loading a config that has more than one slot
+    function Element:EnsureBindSlots(Count)
+        for Number = 1, Count do
+            if not Slots[Number] then
+                CreateSlot(Number);
+            end;
+        end;
+    end;
+
+    CreateSlot(1);
+
+    -- the first bind stays reachable as Element.Bind
+    Element.Bind = Slots[1].Bind;
+    Element.BindPopup = Popup;
+
+    local AddBind = Popup:AddButton({ Text = '+ add bind', Func = function()
+        local Number = 1;
+
+        while Slots[Number] do
+            Number = Number + 1;
         end;
 
-        if InputService:GetFocusedTextBox() then
-            return;
-        end;
+        CreateSlot(Number);
+    end });
 
-        local Key = BindKeyName(Input);
-
-        if Key ~= Bind.Value then
-            return;
-        end;
-
-        -- clicks on gui (including this menu) don't count for mouse binds
-        if Processed and Input.UserInputType ~= Enum.UserInputType.Keyboard then
-            return;
-        end;
-
-        if Bind.Mode == 'Toggle' then
-            Bind:SetActive(not Bind.Active);
-        else
-            Bind:SetActive(true);
-        end;
-    end));
-
-    Library:GiveSignal(InputService.InputEnded:Connect(function(Input)
-        if Bind.Mode == 'Hold' and Bind.Active and BindKeyName(Input) == Bind.Value then
-            Bind:SetActive(false);
-        end;
-    end));
+    -- always at the bottom, new slots go above it
+    AddBind.Outer.LayoutOrder = 100000;
 
     Region.InputBegan:Connect(function(Input)
         if Input.UserInputType == Enum.UserInputType.MouseButton2 and not Library:MouseIsOverOpenedFrame() then
             Popup:SetOpen(not Popup.Open);
         end;
     end);
-
-    Element.Bind = Bind;
-    Element.BindPopup = Popup;
-    Options[Idx .. '_bind'] = Bind;
-
-    Library:AddBindListEntry(Bind, Info.Text or Idx, Element, Info);
-
-    Bind:Update();
 end;
 
 -- Button that picks the key which opens / closes the menu. Returns an object shaped like a keypicker.
@@ -3500,6 +3648,17 @@ do
         table.insert(Library.BindEntries, { Bind = Bind, Name = Name, Element = Element, Info = Info, Row = Row, Label = Label, Shown = false });
     end;
 
+    function Library:RemoveBindListEntry(Bind)
+        for Position, Entry in next, Library.BindEntries do
+            if Entry.Bind == Bind then
+                Entry.Row:Destroy();
+                table.remove(Library.BindEntries, Position);
+
+                return;
+            end;
+        end;
+    end;
+
     function Library:SetBindListVisibility(Bool)
         Library.BindListEnabled = not not Bool;
     end;
@@ -3538,7 +3697,8 @@ do
             local Bind = Entry.Bind;
             local Label = Entry.Label;
 
-            local Want = Bind.Value ~= 'None' and (Bind.Active or not Library.BindListOnlyActive);
+            -- when several binds of one element are held only the newest one (the one in effect) is listed
+            local Want = Bind.Value ~= 'None' and (Bind.Active or not Library.BindListOnlyActive) and not (Bind.Active and not Bind.Top);
 
             if Want then
                 Rows = Rows + 1;
@@ -4750,6 +4910,19 @@ local SaveManager = {} do
 
         local success, decoded = pcall(HttpService.JSONDecode, HttpService, readfile(file))
         if not success then return false, 'decode error' end
+
+        -- extra binds ("<idx>_bind2", "<idx>_bind3", ...) have to exist before their values are loaded
+        for _, option in next, decoded.objects do
+            local BaseIdx, Number = tostring(option.idx):match('^(.*)_bind(%d+)$');
+
+            if BaseIdx then
+                local Element = Options[BaseIdx] or Toggles[BaseIdx];
+
+                if Element and Element.EnsureBindSlots then
+                    Element:EnsureBindSlots(tonumber(Number));
+                end;
+            end;
+        end;
 
         for _, option in next, decoded.objects do
             if self.Parser[option.type] then

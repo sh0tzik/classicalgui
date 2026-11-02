@@ -3905,6 +3905,642 @@ function Library:Notify(Text, Time)
     end);
 end;
 
+-- Player list ----------------------------------------------------------------------------------
+-- Per player settings (priority / whitelist / disable visuals) kept by UserId and saved to a file.
+-- Scripts read them with Library:GetPriority(Player), Library:IsWhitelisted(Player) and
+-- Library:IsVisualsDisabled(Player), and can listen with Library:OnPlayerStateChanged(Callback).
+
+-- (inside a do-block so these helpers don't add to the file's top-level local count, which Luau caps at 200)
+do
+Library.PlayerListFile = 'LinoriaLib/playerlist.json';
+Library.PlayerStates = {};
+Library.PlayerStateCallbacks = {};
+
+local PlayerPriorities = { 'none', 'low', 'medium', 'high', 'target' };
+local PlayerStatesLoaded = false;
+local PlayerStatesSaving = false;
+
+local function DefaultPlayerState()
+    return { Priority = 'none', Whitelist = false, DisableVisuals = false };
+end;
+
+local function LoadPlayerStates()
+    if PlayerStatesLoaded then
+        return;
+    end;
+
+    PlayerStatesLoaded = true;
+
+    pcall(function()
+        if not isfile(Library.PlayerListFile) then
+            return;
+        end;
+
+        local Data = game:GetService('HttpService'):JSONDecode(readfile(Library.PlayerListFile));
+
+        for Id, Saved in next, Data do
+            local State = DefaultPlayerState();
+
+            if table.find(PlayerPriorities, Saved.p) then
+                State.Priority = Saved.p;
+            end;
+
+            State.Whitelist = Saved.w == true;
+            State.DisableVisuals = Saved.v == true;
+
+            Library.PlayerStates[tonumber(Id)] = State;
+        end;
+    end);
+end;
+
+local function SavePlayerStates()
+    if PlayerStatesSaving then
+        return;
+    end;
+
+    PlayerStatesSaving = true;
+
+    -- changes within half a second are written together
+    task.delay(0.5, function()
+        PlayerStatesSaving = false;
+
+        pcall(function()
+            local Out = {};
+
+            for Id, State in next, Library.PlayerStates do
+                if State.Priority ~= 'none' or State.Whitelist or State.DisableVisuals then
+                    Out[tostring(Id)] = { p = State.Priority, w = State.Whitelist, v = State.DisableVisuals };
+                end;
+            end;
+
+            local Folder = Library.PlayerListFile:match('^(.*)/[^/]*$');
+
+            if Folder and not isfolder(Folder) then
+                makefolder(Folder);
+            end;
+
+            writefile(Library.PlayerListFile, game:GetService('HttpService'):JSONEncode(Out));
+        end);
+    end);
+end;
+
+function Library:GetPlayerState(Player)
+    LoadPlayerStates();
+
+    local State = Library.PlayerStates[Player.UserId];
+
+    if not State then
+        State = DefaultPlayerState();
+        Library.PlayerStates[Player.UserId] = State;
+    end;
+
+    return State;
+end;
+
+-- Key: 'Priority' ('none' / 'low' / 'medium' / 'high' / 'target'), 'Whitelist' or 'DisableVisuals'
+function Library:SetPlayerState(Player, Key, Value)
+    local State = Library:GetPlayerState(Player);
+    State[Key] = Value;
+
+    SavePlayerStates();
+
+    for _, Callback in next, Library.PlayerStateCallbacks do
+        Library:SafeCallback(Callback, Player, Key, Value, State);
+    end;
+end;
+
+function Library:OnPlayerStateChanged(Callback)
+    table.insert(Library.PlayerStateCallbacks, Callback);
+end;
+
+function Library:IsWhitelisted(Player)
+    return Library:GetPlayerState(Player).Whitelist;
+end;
+
+function Library:IsVisualsDisabled(Player)
+    return Library:GetPlayerState(Player).DisableVisuals;
+end;
+
+-- 0 (none) .. 4 (target)
+function Library:GetPriority(Player)
+    return (table.find(PlayerPriorities, Library:GetPlayerState(Player).Priority) or 1) - 1;
+end;
+
+local function BuildPlayerList(Window, TabName)
+    LoadPlayerStates();
+
+    local Tab = Window:AddTab(TabName);
+
+    local ListBox = Tab:AddLeftGroupbox('players');
+    local Details = Tab:AddRightGroupbox('player');
+
+    local ROW_HEIGHT = 36;
+    local LIST_HEIGHT = 300;
+
+    local Rows = {};
+    local Selected;
+    local Updating = false;
+    local AvatarCache = {};
+
+    ListBox:AddInput('PlayerList_Search', { Text = 'search', Placeholder = 'name or team' });
+    ListBox:AddDropdown('PlayerList_Sort', { Text = 'sort by', Values = { 'name', 'team', 'priority', 'distance' }, Default = 'team', NoBind = true });
+
+    -- the list --------------------------------------------------------------------------------
+    local ListFrame = Library:Create('Frame', {
+        BackgroundColor3 = Library.MainColor;
+        BorderColor3 = Library.OutlineColor;
+        Size = UDim2.new(1, -4, 0, LIST_HEIGHT);
+        ZIndex = 5;
+        Parent = ListBox.Container;
+    });
+    Library:Round(ListFrame, 4);
+
+    Library:AddToRegistry(ListFrame, {
+        BackgroundColor3 = 'MainColor';
+        BorderColor3 = 'OutlineColor';
+    });
+
+    local Scroll = Library:Create('ScrollingFrame', {
+        AutomaticCanvasSize = Enum.AutomaticSize.Y;
+        BackgroundTransparency = 1;
+        BorderSizePixel = 0;
+        BottomImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png';
+        CanvasSize = UDim2.new(0, 0, 0, 0);
+        Position = UDim2.fromOffset(2, 2);
+        ScrollBarImageColor3 = Library.AccentColor;
+        ScrollBarThickness = 3;
+        Size = UDim2.new(1, -4, 1, -4);
+        TopImage = 'rbxasset://textures/ui/Scroll/scroll-middle.png';
+        ZIndex = 5;
+        Parent = ListFrame;
+    });
+
+    Library:AddToRegistry(Scroll, {
+        ScrollBarImageColor3 = 'AccentColor';
+    });
+
+    Library:Create('UIListLayout', {
+        Padding = UDim.new(0, 2);
+        FillDirection = Enum.FillDirection.Vertical;
+        SortOrder = Enum.SortOrder.LayoutOrder;
+        Parent = Scroll;
+    });
+
+    ListBox:AddBlank(4);
+    ListBox:Resize();
+
+    -- details ---------------------------------------------------------------------------------
+    local Header = Library:Create('Frame', {
+        BackgroundTransparency = 1;
+        Size = UDim2.new(1, -4, 0, 58);
+        ZIndex = 5;
+        Parent = Details.Container;
+    });
+
+    local BigAvatar = Library:Create('ImageLabel', {
+        BackgroundColor3 = Library.MainColor;
+        BorderSizePixel = 0;
+        Position = UDim2.fromOffset(2, 4);
+        Size = UDim2.fromOffset(50, 50);
+        ZIndex = 6;
+        Parent = Header;
+    });
+    Library:Round(BigAvatar, 8);
+
+    Library:AddToRegistry(BigAvatar, {
+        BackgroundColor3 = 'MainColor';
+    });
+
+    local function HeaderLabel(Y, Size)
+        return Library:CreateLabel({
+            Position = UDim2.fromOffset(60, Y);
+            Size = UDim2.new(1, -62, 0, Size + 3);
+            Text = '';
+            TextSize = Size;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 6;
+            Parent = Header;
+        });
+    end;
+
+    local HeaderName = HeaderLabel(6, 15);
+    local HeaderUser = HeaderLabel(24, 12);
+    local HeaderInfo = HeaderLabel(39, 12);
+
+    HeaderName.Text = 'select a player';
+    HeaderUser.TextColor3 = Library.DimColor;
+    HeaderInfo.TextColor3 = Library.DimColor;
+    HeaderInfo.RichText = true;
+
+    Library.RegistryMap[HeaderUser].Properties.TextColor3 = 'DimColor';
+    Library.RegistryMap[HeaderInfo].Properties.TextColor3 = 'DimColor';
+
+    Details:AddBlank(6);
+    Details:AddDivider();
+
+    Details:AddDropdown('PlayerList_Priority', {
+        Text = 'priority';
+        Values = PlayerPriorities;
+        Default = 'none';
+        NoBind = true;
+        Callback = function(Value)
+            if Updating or not Selected or not Value then
+                return;
+            end;
+
+            Library:SetPlayerState(Selected, 'Priority', Value);
+        end;
+    });
+
+    Details:AddToggle('PlayerList_Whitelist', {
+        Text = 'whitelist';
+        Default = false;
+        NoBind = true;
+        Callback = function(Value)
+            if Updating or not Selected then
+                return;
+            end;
+
+            Library:SetPlayerState(Selected, 'Whitelist', Value);
+        end;
+    });
+
+    Details:AddToggle('PlayerList_DisableVisuals', {
+        Text = 'disable visuals';
+        Default = false;
+        NoBind = true;
+        Callback = function(Value)
+            if Updating or not Selected then
+                return;
+            end;
+
+            Library:SetPlayerState(Selected, 'DisableVisuals', Value);
+        end;
+    });
+
+    Details:AddDivider();
+
+    Details:AddButton({ Text = 'copy username', Func = function()
+        if Selected then
+            pcall(setclipboard, Selected.Name);
+            Library:Notify('Copied ' .. Selected.Name, 2);
+        end;
+    end });
+
+    Details:AddButton({ Text = 'copy user id', Func = function()
+        if Selected then
+            pcall(setclipboard, tostring(Selected.UserId));
+            Library:Notify('Copied ' .. Selected.UserId, 2);
+        end;
+    end });
+
+    -- these belong to the selected player, never to a config
+    if Library.SaveManager then
+        for _, Id in next, { 'PlayerList_Search', 'PlayerList_Sort', 'PlayerList_Priority', 'PlayerList_Whitelist', 'PlayerList_DisableVisuals' } do
+            Library.SaveManager.Ignore[Id] = true;
+        end;
+    end;
+
+    -- helpers ---------------------------------------------------------------------------------
+    local function TeamOf(Player)
+        local Team = Player.Team;
+
+        if Team then
+            return Team.Name, Team.TeamColor.Color;
+        end;
+
+        return 'no team', Library.DimColor;
+    end;
+
+    local function DistanceTo(Player)
+        local Mine = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart');
+        local Theirs = Player.Character and Player.Character:FindFirstChild('HumanoidRootPart');
+
+        if Mine and Theirs then
+            return (Mine.Position - Theirs.Position).Magnitude;
+        end;
+    end;
+
+    local function LoadAvatar(Player, Target)
+        local Cached = AvatarCache[Player.UserId];
+
+        if Cached then
+            Target.Image = Cached;
+            return;
+        end;
+
+        task.spawn(function()
+            local Success, Image = pcall(Players.GetUserThumbnailAsync, Players, Player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100);
+
+            if Success then
+                AvatarCache[Player.UserId] = Image;
+                Target.Image = Image;
+            end;
+        end);
+    end;
+
+    local function Describe(Player)
+        local TeamName, TeamColor = TeamOf(Player);
+        local Distance = DistanceTo(Player);
+
+        local Text = ('<font color="#%s">%s</font>'):format(TeamColor:ToHex(), TeamName);
+
+        if Player == LocalPlayer then
+            Text = Text .. '  |  you';
+        elseif Distance then
+            Text = Text .. ('  |  %dm'):format(math.floor(Distance + 0.5));
+        end;
+
+        return Text;
+    end;
+
+    local function Tags(Player)
+        local State = Library:GetPlayerState(Player);
+        local Parts = {};
+
+        if State.Priority ~= 'none' then
+            table.insert(Parts, ('<font color="#%s">%s</font>'):format(Library.AccentColor:ToHex(), State.Priority));
+        end;
+
+        if State.Whitelist then
+            table.insert(Parts, '<font color="#6fd08c">wl</font>');
+        end;
+
+        if State.DisableVisuals then
+            table.insert(Parts, '<font color="#d0806f">no esp</font>');
+        end;
+
+        return table.concat(Parts, '  ');
+    end;
+
+    local function UpdateRow(Row)
+        local Player = Row.Player;
+
+        Row.Name.Text = Player.DisplayName ~= Player.Name and (Player.DisplayName .. '  (' .. Player.Name .. ')') or Player.Name;
+        Row.Sub.Text = Describe(Player);
+        Row.Tags.Text = Tags(Player);
+
+        Library:Tween(Row.Frame, {
+            BackgroundTransparency = Selected == Player and 0.75 or 1;
+            BackgroundColor3 = Selected == Player and Library.AccentColor or Library.OutlineColor;
+        }, 0.12);
+    end;
+
+    local function UpdateDetails()
+        Updating = true;
+
+        if Selected then
+            local State = Library:GetPlayerState(Selected);
+
+            HeaderName.Text = Selected.DisplayName;
+            HeaderUser.Text = '@' .. Selected.Name;
+            HeaderInfo.Text = Describe(Selected) .. ('  |  id %d'):format(Selected.UserId);
+
+            LoadAvatar(Selected, BigAvatar);
+
+            Options.PlayerList_Priority:SetValue(State.Priority);
+            Toggles.PlayerList_Whitelist:SetValue(State.Whitelist);
+            Toggles.PlayerList_DisableVisuals:SetValue(State.DisableVisuals);
+        else
+            HeaderName.Text = 'select a player';
+            HeaderUser.Text = '';
+            HeaderInfo.Text = '';
+            BigAvatar.Image = '';
+
+            Options.PlayerList_Priority:SetValue('none');
+            Toggles.PlayerList_Whitelist:SetValue(false);
+            Toggles.PlayerList_DisableVisuals:SetValue(false);
+        end;
+
+        Updating = false;
+    end;
+
+    -- orders + filters the rows
+    local function Refresh()
+        local Query = string.lower(Options.PlayerList_Search.Value or '');
+        local Mode = Options.PlayerList_Sort.Value or 'name';
+        local List = {};
+
+        for Player, Row in next, Rows do
+            local TeamName = TeamOf(Player);
+
+            local Match = Query == ''
+                or string.find(string.lower(Player.Name), Query, 1, true)
+                or string.find(string.lower(Player.DisplayName), Query, 1, true)
+                or string.find(string.lower(TeamName), Query, 1, true);
+
+            Row.Frame.Visible = Match and true or false;
+
+            if Match then
+                table.insert(List, Player);
+            end;
+        end;
+
+        table.sort(List, function(A, B)
+            if Mode == 'team' then
+                local TeamA, TeamB = TeamOf(A), TeamOf(B);
+
+                if TeamA ~= TeamB then
+                    return TeamA < TeamB;
+                end;
+            elseif Mode == 'priority' then
+                local PriorityA, PriorityB = Library:GetPriority(A), Library:GetPriority(B);
+
+                if PriorityA ~= PriorityB then
+                    return PriorityA > PriorityB;
+                end;
+            elseif Mode == 'distance' then
+                local DistanceA, DistanceB = DistanceTo(A) or math.huge, DistanceTo(B) or math.huge;
+
+                if DistanceA ~= DistanceB then
+                    return DistanceA < DistanceB;
+                end;
+            end;
+
+            return string.lower(A.DisplayName) < string.lower(B.DisplayName);
+        end);
+
+        for Index, Player in ipairs(List) do
+            Rows[Player].Frame.LayoutOrder = Index;
+        end;
+    end;
+
+    local function Select(Player)
+        Selected = Player;
+
+        for _, Row in next, Rows do
+            UpdateRow(Row);
+        end;
+
+        UpdateDetails();
+    end;
+
+    local function AddPlayer(Player)
+        if Rows[Player] then
+            return;
+        end;
+
+        local Row = { Player = Player };
+
+        Row.Frame = Library:Create('Frame', {
+            BackgroundColor3 = Library.OutlineColor;
+            BackgroundTransparency = 1;
+            BorderSizePixel = 0;
+            Size = UDim2.new(1, -6, 0, ROW_HEIGHT);
+            ZIndex = 6;
+            Parent = Scroll;
+        });
+        Library:Round(Row.Frame, 4);
+
+        Row.Avatar = Library:Create('ImageLabel', {
+            BackgroundColor3 = Library.BackgroundColor;
+            BorderSizePixel = 0;
+            Position = UDim2.new(0, 5, 0.5, -14);
+            Size = UDim2.fromOffset(28, 28);
+            ZIndex = 7;
+            Parent = Row.Frame;
+        });
+        Library:Round(Row.Avatar, 6);
+
+        Library:AddToRegistry(Row.Avatar, {
+            BackgroundColor3 = 'BackgroundColor';
+        });
+
+        Row.Name = Library:CreateLabel({
+            Position = UDim2.fromOffset(40, 3);
+            Size = UDim2.new(1, -46, 0, 16);
+            TextSize = 13;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 7;
+            Parent = Row.Frame;
+        });
+
+        Row.Sub = Library:CreateLabel({
+            Position = UDim2.fromOffset(40, 19);
+            Size = UDim2.new(0.6, -40, 0, 13);
+            RichText = true;
+            TextColor3 = Library.DimColor;
+            TextSize = 11;
+            TextXAlignment = Enum.TextXAlignment.Left;
+            ZIndex = 7;
+            Parent = Row.Frame;
+        });
+
+        Library.RegistryMap[Row.Sub].Properties.TextColor3 = 'DimColor';
+
+        Row.Tags = Library:CreateLabel({
+            AnchorPoint = Vector2.new(1, 0);
+            Position = UDim2.new(1, -6, 0, 19);
+            Size = UDim2.new(0.4, 0, 0, 13);
+            RichText = true;
+            TextSize = 11;
+            TextXAlignment = Enum.TextXAlignment.Right;
+            ZIndex = 7;
+            Parent = Row.Frame;
+        });
+
+        Row.Frame.InputBegan:Connect(function(Input)
+            if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
+                Select(Player);
+            end;
+        end);
+
+        Row.Frame.MouseEnter:Connect(function()
+            if Selected ~= Player then
+                Library:Tween(Row.Frame, { BackgroundTransparency = 0.55 }, 0.1);
+            end;
+        end);
+
+        Row.Frame.MouseLeave:Connect(function()
+            if Selected ~= Player then
+                Library:Tween(Row.Frame, { BackgroundTransparency = 1 }, 0.1);
+            end;
+        end);
+
+        Library:GiveSignal(Player:GetPropertyChangedSignal('Team'):Connect(function()
+            UpdateRow(Row);
+            Refresh();
+        end));
+
+        Rows[Player] = Row;
+
+        LoadAvatar(Player, Row.Avatar);
+        UpdateRow(Row);
+        Refresh();
+    end;
+
+    local function RemovePlayer(Player)
+        local Row = Rows[Player];
+
+        if not Row then
+            return;
+        end;
+
+        Row.Frame:Destroy();
+        Rows[Player] = nil;
+
+        if Selected == Player then
+            Select(nil);
+        end;
+
+        Refresh();
+    end;
+
+    Options.PlayerList_Search:OnChanged(Refresh);
+    Options.PlayerList_Sort:OnChanged(Refresh);
+
+    Library:OnPlayerStateChanged(function(Player)
+        local Row = Rows[Player];
+
+        if Row then
+            UpdateRow(Row);
+        end;
+
+        Refresh();
+
+        if Player == Selected then
+            UpdateDetails();
+        end;
+    end);
+
+    Library:GiveSignal(Players.PlayerAdded:Connect(AddPlayer));
+    Library:GiveSignal(Players.PlayerRemoving:Connect(RemovePlayer));
+
+    for _, Player in next, Players:GetPlayers() do
+        AddPlayer(Player);
+    end;
+
+    -- distances / teams change over time, so refresh once a second while the tab is open
+    local Timer = 0;
+
+    Library:GiveSignal(RenderStepped:Connect(function(Delta)
+        Timer = Timer + Delta;
+
+        if Timer < 1 or not Tab.Frame.Visible then
+            return;
+        end;
+
+        Timer = 0;
+
+        for _, Row in next, Rows do
+            UpdateRow(Row);
+        end;
+
+        if Selected then
+            HeaderInfo.Text = Describe(Selected) .. ('  |  id %d'):format(Selected.UserId);
+        end;
+
+        if Options.PlayerList_Sort.Value == 'distance' then
+            Refresh();
+        end;
+    end));
+
+    return Tab;
+end;
+
+Library.BuildPlayerList = BuildPlayerList;
+end;
+
 function Library:CreateWindow(...)
     local Arguments = { ... }
     local Config = { AnchorPoint = Vector2.zero }
@@ -4634,8 +5270,31 @@ function Library:CreateWindow(...)
             Tab:ShowTab();
         end;
 
+        Tab.Frame = TabFrame;
+        Tab.Button = TabButton;
+
         Window.Tabs[Name] = Tab;
         return Tab;
+    end;
+
+    -- Adds the built-in player list tab (players with avatars, sorting, priority / whitelist / disable visuals).
+    -- It is added automatically as the last tab; pass `PlayerList = false` to CreateWindow to turn that off.
+    function Window:AddPlayerList(Name)
+        if Window.PlayerListTab then
+            return Window.PlayerListTab;
+        end;
+
+        Window.PlayerListTab = Library.BuildPlayerList(Window, Name or 'playerlist');
+
+        return Window.PlayerListTab;
+    end;
+
+    if Config.PlayerList ~= false then
+        -- deferred so the script's own tabs are created first (and the first of them is the one shown)
+        task.defer(function()
+            local PlayerListTab = Window:AddPlayerList(Config.PlayerListName);
+            PlayerListTab.Button.LayoutOrder = 9999;
+        end);
     end;
 
     local ModalElement = Library:Create('TextButton', {
